@@ -14,21 +14,80 @@ API Key: 从环境变量 TAVILY_API_KEY 读取，或通过 --api-key 传入
 """
 
 import argparse
+import gzip
+import io
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
+import http.cookiejar
+import zlib
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Referer": "https://news.yaozh.com/",
-}
+# 一组真实 Chrome/Edge UA，随机选取以降低指纹一致性
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+]
+
+
+def _browser_headers(referer: str = "https://news.yaozh.com/", ua: str = None) -> dict:
+    """构造接近真实浏览器导航请求的头部。"""
+    ua = ua or random.choice(USER_AGENTS)
+    is_edge = "Edg/" in ua
+    brand = '"Microsoft Edge"' if is_edge else '"Google Chrome"'
+    ver = re.search(r"Chrome/(\d+)", ua)
+    ver = ver.group(1) if ver else "130"
+    platform = '"macOS"' if "Mac OS X" in ua else '"Windows"'
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Ch-Ua": f'"Chromium";v="{ver}", {brand};v="{ver}", "Not?A_Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": platform,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin" if "yaozh.com" in referer else "none",
+        "Sec-Fetch-User": "?1",
+        "Referer": referer,
+    }
+
+
+def _decode_response(resp) -> str:
+    """读取并按 Content-Encoding 解压响应体。"""
+    raw = resp.read()
+    enc = (resp.headers.get("Content-Encoding") or "").lower()
+    if enc == "gzip":
+        raw = gzip.decompress(raw)
+    elif enc == "deflate":
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            raw = zlib.decompress(raw, -zlib.MAX_WBITS)
+    # 大多数页面是 utf-8；保留 errors=replace 兜底
+    return raw.decode("utf-8", errors="replace")
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """带 cookie jar 的 opener，在站内导航时携带服务端 set-cookie。"""
+    jar = http.cookiejar.CookieJar()
+    return urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar),
+        urllib.request.HTTPRedirectHandler(),
+    )
 
 
 def get_tavily_key(explicit_key: str = None) -> str:
@@ -52,13 +111,17 @@ def get_tavily_key(explicit_key: str = None) -> str:
 
 
 def tavily_search(term: str, api_key: str, max_results: int = 10) -> list:
-    """用 Tavily 搜索 site:news.yaozh.com，返回 [{title, url, content, published_date}]"""
+    """用 Tavily 搜索 site:news.yaozh.com，返回 [{title, url, content, published_date}]
+
+    打开 include_raw_content：让 Tavily 直接返回正文，避免后续大量二次抓取触发 403。
+    """
     query = f"site:news.yaozh.com {term}"
     payload = json.dumps({
         "query": query,
         "search_depth": "advanced",
         "max_results": max_results,
         "include_domains": ["news.yaozh.com"],
+        "include_raw_content": True,
         "topic": "general",
     }).encode("utf-8")
 
@@ -83,30 +146,105 @@ def tavily_search(term: str, api_key: str, max_results: int = 10) -> list:
                 "url": url,
                 "date": r.get("published_date", ""),
                 "snippet": r.get("content", ""),
+                "raw_content": r.get("raw_content") or "",
                 "content": None,
             })
     return results
 
 
-def fetch_article(url: str) -> dict:
+def tavily_extract(url: str, api_key: str) -> str:
+    """调用 Tavily Extract API 用其代理池代抓正文，绕开本地 IP 被封。
+
+    返回纯文本正文；失败/空内容时返回空串（由调用方继续兜底）。
+    """
+    payload = json.dumps({
+        "urls": [url],
+        "extract_depth": "advanced",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.tavily.com/extract",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except Exception:
+        return ""
+    for item in data.get("results", []):
+        if item.get("url") == url or item.get("raw_content"):
+            return item.get("raw_content") or ""
+    return ""
+
+
+def http_get(url: str, opener: urllib.request.OpenerDirector, referer: str,
+             ua: str, retries: int = 3) -> str:
+    """带重试/退避的 HTTP GET。403/429/5xx 时换 UA 重试。"""
+    last_err = None
+    for attempt in range(retries):
+        headers = _browser_headers(referer=referer, ua=ua)
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with opener.open(req, timeout=20) as resp:
+                return _decode_response(resp)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (403, 429, 500, 502, 503, 504) and attempt < retries - 1:
+                ua = random.choice(USER_AGENTS)  # 换指纹
+                time.sleep(1.5 * (attempt + 1) + random.random())
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("http_get exhausted retries")
+
+
+def _warmup(opener: urllib.request.OpenerDirector, ua: str) -> None:
+    """先访问首页拿一次 cookie，更接近真实浏览器行为，提高文章页通过率。"""
+    try:
+        http_get("https://news.yaozh.com/", opener, referer="https://www.google.com/",
+                 ua=ua, retries=2)
+    except Exception:
+        pass
+
+
+def fetch_article(url: str, opener: urllib.request.OpenerDirector, ua: str) -> dict:
     """HTTP 抓取单篇药智新闻文章，返回 {title, url, date, content}"""
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
+    html = http_get(url, opener, referer="https://news.yaozh.com/", ua=ua, retries=3)
 
-    # Title
-    title_match = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.S)
-    title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else ""
+    # Title — 优先 .l_title，再回退到 <title>，避免拿到首个 logo h1
+    title = ""
+    m = re.search(r'<h1[^>]*class="[^"]*l_title[^"]*"[^>]*>(.*?)</h1>', html, re.S)
+    if m:
+        title = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+    if not title:
+        m = re.search(r'<title>(.*?)</title>', html, re.S)
+        if m:
+            title = re.sub(r'_药智新闻\s*$', '', m.group(1).strip())
 
-    # Date - yaozh format: "2025 04/22" in page text
-    date_match = re.search(r'(\d{4})\s+(\d{2}/\d{2})', html)
-    if date_match:
-        year = date_match.group(1)
-        md = date_match.group(2).replace("/", "-")
-        date = f"{year}-{md}"
+    # Date —— 最稳的来源是内联 JS 里的 add_date:"YYYY-MM-DD"
+    date = ""
+    m = re.search(r'add_date["\']?\s*:\s*["\'](\d{4}-\d{2}-\d{2})', html)
+    if m:
+        date = m.group(1)
     else:
-        dm2 = re.search(r'(\d{4}-\d{2}-\d{2})', html)
-        date = dm2.group(1) if dm2 else ""
+        # 兜底：line_time 区块；最后才退回到全文第一个日期串
+        m = re.search(r'class="line_time"[^>]*>.*?(\d{4})\D+(\d{1,2})\D+(\d{1,2})', html, re.S)
+        if m:
+            date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        else:
+            m = re.search(r'(\d{4}-\d{2}-\d{2})', html)
+            date = m.group(1) if m else ""
 
     # Clean HTML
     clean = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.S)
@@ -159,30 +297,55 @@ def main():
 
     print(f"找到 {len(results)} 篇文章，正在抓取全文...", file=sys.stderr)
 
-    # Step 2: 抓取每篇文章全文
+    # Step 2: 抓取每篇文章全文 —— 共享 cookie/UA 模拟同一会话
+    opener = _build_opener()
+    ua = random.choice(USER_AGENTS)
+    _warmup(opener, ua)
+
     articles = []
     for i, r in enumerate(results):
+        # 四层兜底：直接抓 → Tavily search 自带 raw_content → Tavily Extract API → snippet
+        title = r.get("title", "")
+        date = r.get("date", "")
+        content = ""
+        source = ""
+
         try:
-            article = fetch_article(r["url"])
-            # Fallback to Tavily snippet if content is empty
-            if not article["content"] and r.get("snippet"):
-                article["content"] = r["snippet"]
-            if not article["title"] and r.get("title"):
-                article["title"] = r["title"]
-            if not article["date"] and r.get("date"):
-                article["date"] = r["date"]
-            articles.append(article)
-            if i < len(results) - 1:
-                time.sleep(0.5)
+            article = fetch_article(r["url"], opener, ua)
+            if article["title"]:
+                title = article["title"]
+            if article["date"]:
+                date = article["date"]
+            if article["content"]:
+                content = article["content"]
+                source = "direct"
         except Exception as e:
-            print(f"  跳过 {r['url']}: {e}", file=sys.stderr)
-            # Still include with Tavily data
-            articles.append({
-                "title": r.get("title", ""),
-                "url": r["url"],
-                "date": r.get("date", ""),
-                "content": r.get("snippet", ""),
-            })
+            print(f"  直接抓取失败: {r['url']} ({e})", file=sys.stderr)
+
+        if not content and r.get("raw_content"):
+            content = r["raw_content"]
+            source = "tavily-search-raw"
+
+        if not content:
+            print(f"  使用 Tavily Extract 兜底: {r['url']}", file=sys.stderr)
+            ex = tavily_extract(r["url"], api_key)
+            if ex:
+                content = ex
+                source = "tavily-extract"
+
+        if not content and r.get("snippet"):
+            content = r["snippet"]
+            source = "tavily-snippet"
+
+        articles.append({
+            "title": title,
+            "url": r["url"],
+            "date": date,
+            "content": content,
+            "source": source,
+        })
+        if i < len(results) - 1:
+            time.sleep(0.8 + random.random() * 0.7)
 
     if args.json:
         print(json.dumps(articles, ensure_ascii=False, indent=2))
@@ -194,6 +357,8 @@ def main():
             print(f"\n[{i}] {a['title']}")
             print(f"  发表时间: {a['date']}")
             print(f"  链接: {a['url']}")
+            if a.get("source"):
+                print(f"  内容来源: {a['source']}")
             if a.get("content"):
                 print(f"  正文预览:")
                 import textwrap
@@ -208,3 +373,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
