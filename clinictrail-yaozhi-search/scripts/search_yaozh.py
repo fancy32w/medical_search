@@ -218,6 +218,28 @@ def _warmup(opener: urllib.request.OpenerDirector, ua: str) -> None:
         pass
 
 
+def extract_date_from_text(text: str) -> str:
+    """从 HTML 或纯文本里提取首个发表日期，归一为 YYYY-MM-DD。"""
+    if not text:
+        return ""
+    m = re.search(r'add_date["\']?\s*:\s*["\'](\d{4}-\d{2}-\d{2})', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'class="line_time"[^>]*>.*?(\d{4})\D+(\d{1,2})\D+(\d{1,2})', text, re.S)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.search(r'(?:发表时间|发布时间|时间)\s*[:：]\s*(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})', text)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.search(r'(\d{4})-(\d{1,2})-(\d{1,2})', text)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', text)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return ""
+
+
 def fetch_article(url: str, opener: urllib.request.OpenerDirector, ua: str) -> dict:
     """HTTP 抓取单篇药智新闻文章，返回 {title, url, date, content}"""
     html = http_get(url, opener, referer="https://news.yaozh.com/", ua=ua, retries=3)
@@ -232,19 +254,7 @@ def fetch_article(url: str, opener: urllib.request.OpenerDirector, ua: str) -> d
         if m:
             title = re.sub(r'_药智新闻\s*$', '', m.group(1).strip())
 
-    # Date —— 最稳的来源是内联 JS 里的 add_date:"YYYY-MM-DD"
-    date = ""
-    m = re.search(r'add_date["\']?\s*:\s*["\'](\d{4}-\d{2}-\d{2})', html)
-    if m:
-        date = m.group(1)
-    else:
-        # 兜底：line_time 区块；最后才退回到全文第一个日期串
-        m = re.search(r'class="line_time"[^>]*>.*?(\d{4})\D+(\d{1,2})\D+(\d{1,2})', html, re.S)
-        if m:
-            date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        else:
-            m = re.search(r'(\d{4}-\d{2}-\d{2})', html)
-            date = m.group(1) if m else ""
+    date = extract_date_from_text(html)
 
     # Clean HTML
     clean = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.S)
@@ -336,6 +346,10 @@ def main():
         if not content and r.get("snippet"):
             content = r["snippet"]
             source = "tavily-snippet"
+
+        # 直连失败走兜底时 date 仍为空 —— 从已拿到的正文里再抽一次
+        if not date:
+            date = extract_date_from_text(content)
 
         articles.append({
             "title": title,
